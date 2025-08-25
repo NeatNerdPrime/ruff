@@ -26,6 +26,18 @@ def _(t: T):
     static_assert(is_subtype_of(T, Never))
 ```
 
+## fwomp
+
+```py
+from ty_extensions import static_assert, is_subtype_of
+from typing_extensions import Never, TypeVar
+
+T = TypeVar("T", bound=Never)
+
+def _(t: T):
+    static_assert(is_subtype_of(T, Never))
+```
+
 ## `Never` is assignable to every type
 
 `Never` is assignable to every type. This fact is useful when calling error-handling functions in a

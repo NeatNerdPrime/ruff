@@ -41,6 +41,14 @@ pub(crate) trait Constraints<'db>: Clone + Sized {
     /// Returns a constraint set that always holds
     fn always_satisfiable(db: &'db dyn Db) -> Self;
 
+    /// Returns a constraint set that constraints a typevar to a particular range of types.
+    fn constrain_typevar(
+        db: &'db dyn Db,
+        typevar: BoundTypeVarInstance<'db>,
+        lower: Type<'db>,
+        upper: Type<'db>,
+    ) -> Self;
+
     /// Returns whether this constraint set never holds
     fn is_never_satisfied(&self, db: &'db dyn Db) -> bool;
 
@@ -63,6 +71,15 @@ pub(crate) trait Constraints<'db>: Clone + Sized {
         } else {
             Self::unsatisfiable(db)
         }
+    }
+
+    /// Returns a constraint set encoding that this constraint set implies another.
+    ///
+    /// In Boolean logic, `p → q` is usually translated into `¬p ∨ q`. However, we translate it
+    /// into the equivalent `¬p ∨ (p ∧ q)`. This ensures that the constraints under which `q` is
+    /// true are compatible with the assumptions introduced by `p`.
+    fn implies(self, db: &'db dyn Db, other: impl FnOnce() -> Self) -> Self {
+        self.clone().negate(db).or(db, || self.and(db, other))
     }
 
     /// Returns the intersection of this constraint set and another. The other constraint set is
@@ -178,6 +195,10 @@ impl<'db> ConstraintSet<'db> {
         }
     }
 
+    fn always() -> Self {
+        Self::singleton(ConstraintClause::always())
+    }
+
     fn singleton(clause: ConstraintClause<'db>) -> Self {
         Self {
             clauses: smallvec![clause],
@@ -249,7 +270,22 @@ impl<'db> Constraints<'db> for ConstraintSet<'db> {
     }
 
     fn always_satisfiable(_db: &'db dyn Db) -> Self {
-        Self::singleton(ConstraintClause::always())
+        Self::always()
+    }
+
+    fn constrain_typevar(
+        db: &'db dyn Db,
+        typevar: BoundTypeVarInstance<'db>,
+        lower: Type<'db>,
+        upper: Type<'db>,
+    ) -> Self {
+        match AtomicConstraint::positive(db, typevar, lower, upper) {
+            Satisfiable::Never => Self::never(),
+            Satisfiable::Always => Self::always(),
+            Satisfiable::Constrained(constraint) => {
+                Self::singleton(ConstraintClause::singleton(constraint))
+            }
+        }
     }
 
     fn is_never_satisfied(&self, _db: &'db dyn Db) -> bool {
@@ -276,6 +312,17 @@ impl<'db> Constraints<'db> for ConstraintSet<'db> {
             result.intersect_set(db, &clause.negate(db));
         }
         result
+    }
+
+    // XXX
+    fn implies(self, db: &'db dyn Db, other: impl FnOnce() -> Self) -> Self {
+        let q = other();
+        eprintln!("==> {} implies {}", self.display(db), q.display(db));
+        eprintln!(
+            "==> p ∧ q {}",
+            self.clone().and(db, || q.clone()).display(db)
+        );
+        self.clone().negate(db).or(db, || self.and(db, || q))
     }
 }
 
@@ -454,7 +501,7 @@ impl<'db> ConstraintClause<'db> {
 ///   at all, and so we don't need a constraint in the corresponding constraint clause. A negative
 ///   constraint `not(Never ≤: T ≤: object)` means that there is no concrete type the typevar can
 ///   specialize to.)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AtomicConstraint<'db> {
     sign: ConstraintSign,
     typevar: BoundTypeVarInstance<'db>,
@@ -524,23 +571,8 @@ impl<'db> AtomicConstraint<'db> {
     /// `self` and `other` is `self`.
     fn subsumes(self, db: &'db dyn Db, other: Self) -> bool {
         debug_assert!(self.typevar == other.typevar);
-        match (self.sign, other.sign) {
-            (ConstraintSign::Positive, ConstraintSign::Positive) => {
-                other.lower.is_assignable_to(db, self.lower)
-                    && self.upper.is_assignable_to(db, other.upper)
-            }
-
-            (ConstraintSign::Negative, ConstraintSign::Negative) => {
-                self.lower.is_assignable_to(db, other.lower)
-                    && other.upper.is_assignable_to(db, self.upper)
-            }
-
-            (ConstraintSign::Positive, ConstraintSign::Negative) => {
-                self.upper.is_assignable_to(db, other.lower)
-            }
-
-            (ConstraintSign::Negative, ConstraintSign::Positive) => false,
-        }
+        eprintln!("==> subsumes? {} {}", self.display(db), other.display(db));
+        self.intersect(db, other) == IntersectionResult::One(self)
     }
 
     /// Returns the intersection of this atomic constraint and another. Because constraint bounds
@@ -686,14 +718,14 @@ impl<'db> AtomicConstraint<'db> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Satisfiable<T> {
     Never,
     Always,
     Constrained(T),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IntersectionResult<T> {
     Never,
     Always,
